@@ -1,0 +1,48 @@
+<html>
+    <head>
+        <title>Test</title>
+    </head>
+    <body style="margin:0;padding:0;filter:invert();background-color:black;">
+        <object id="dasvg" type="image/svg+xml" data="foo.svg" />
+
+        <script>
+            // Color states for blocks
+            let state = {};
+
+            // Connect to server
+            let socket = new WebSocket("ws://127.0.0.1:9001");
+
+            // Handle status messages from the server
+            socket.onmessage = function(event) {
+                state = JSON.parse(event.data);
+            };
+
+            window.setInterval(function() {
+                // Get access to the SVG image
+                let svg = document.getElementById("dasvg").contentDocument;
+
+                // It's possible the SVG has not loaded yet, if so, return out
+                // early and come back another time.
+                if(!svg) { return; }
+
+                // Handle fadeout
+                for (const [name, record] of Object.entries(state)) {
+                    // Get access to the SVG element
+                    let c = svg.querySelector(`#${name} ellipse`);
+                    if(!c) { continue; }
+                    
+                    let txt = svg.querySelector(`#${name} text`);
+                    if(!txt) { continue; }
+
+                    // Set the color of the SVG element
+                    c.style.fill = `hsl(240, 100%, ${record.color}%)`;
+
+                    // Set coverage text
+                    txt.firstChild.data =
+                        `${record.coverage} (${record.discovered})`;
+                }
+            }, 15);
+        </script>
+    </body>
+</html>
+
