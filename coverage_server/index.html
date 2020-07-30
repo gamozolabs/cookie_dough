@@ -15,9 +15,7 @@
             // Handle status messages from the server
             socket.onmessage = function(event) {
                 state = JSON.parse(event.data);
-            };
-
-            window.setInterval(function() {
+                
                 // Get access to the SVG image
                 let svg = document.getElementById("dasvg").contentDocument;
 
@@ -41,7 +39,7 @@
                     txt.firstChild.data =
                         `${record.coverage} (${record.discovered})`;
                 }
-            }, 15);
+            };
         </script>
     </body>
 </html>

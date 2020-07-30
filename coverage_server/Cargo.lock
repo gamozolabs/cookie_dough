@@ -90,6 +90,7 @@ name = "coverage_server"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rand",
  "serde",
  "serde_json",
  "tungstenite",

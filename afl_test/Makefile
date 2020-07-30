@@ -1,7 +1,6 @@
 
 all:
-	rm -f shared_memory.shm 
-	~/AFLplusplus/afl-clang ./foo.c
+	~/AFLplusplus/afl-clang-fast -O2 ./foo.c
 
 fuzz: all
 	AFL_SKIP_CPUFREQ=1 ~/AFLplusplus/afl-fuzz -p fast -d -i inputs -o outputs ./a.out @@

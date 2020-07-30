@@ -5,7 +5,7 @@ use std::collections::{VecDeque, BTreeSet};
 use rand::random;
 
 /// Max size of all fuzz inputs
-const INPUT_SIZE: usize = 256;
+const INPUT_SIZE: usize = 512;
 
 /// The root node is always the 0th index in the node list
 const ROOT: NodeRef = NodeRef(0);
@@ -88,7 +88,7 @@ impl Graph {
     }
     
     /// Create a new random graph using only linear conditional flow (no loops)
-    pub fn new_rand_cond_noloop(max_depth: usize) -> Self {
+    pub fn new_rand_cond_noloop(num_nodes: usize) -> Self {
         let mut graph = Graph::new();
 
         let mut visited = BTreeSet::new();
@@ -100,7 +100,12 @@ impl Graph {
 
         while let Some((depth, node)) = queue.pop_back() {
             if !visited.insert(node) { continue; }
-            if depth > max_depth { continue; }
+        
+            let mut reported = BTreeSet::new();
+            graph.traverse_bfs(|from, _to| {
+                reported.insert(from.id);
+            });
+            if reported.len() > num_nodes { continue; }
 
             let min = random::<u8>();
             assert!(cur_byte < INPUT_SIZE);
@@ -187,13 +192,16 @@ impl Graph {
 #include <immintrin.h>
 #include <sys/mman.h>
 
+__AFL_FUZZ_INIT();
+
 struct _shmem {{
     uint64_t fuzz_cases;
     uint64_t coverage;
     uint64_t coverage_freqs[1024];
+    uint64_t hit_on_case[1024];
 }};
 
-void parser(struct _shmem *shmem, uint8_t *input, size_t input_size);
+void parser(volatile struct _shmem *shmem, uint8_t *input, size_t input_size);
 
 uint64_t
 xorshift(void) {{
@@ -227,7 +235,7 @@ main(int argc, char *argv[]) {{
 
     ftruncate(shmfd, sizeof(struct _shmem));
 
-    struct _shmem *shm = mmap(NULL, sizeof(struct _shmem),
+    volatile struct _shmem *shm = mmap(NULL, sizeof(struct _shmem),
         PROT_READ | PROT_WRITE, MAP_SHARED, shmfd, 0);
     if(shm == MAP_FAILED) {{
         perror("mmap() error ");
@@ -235,21 +243,13 @@ main(int argc, char *argv[]) {{
     }}
     
     if(strcmp(argv[1], "internal")) {{
-        FILE *fd = fopen(argv[1], "rb");
-        if(!fd) {{
-            perror("fopen() error ");
-            return -1;
+        while(__AFL_LOOP(100000)) {{
+            buf = __AFL_FUZZ_TESTCASE_BUF;
+            size_t input_len = __AFL_FUZZ_TESTCASE_LEN;
+            parser(shm, buf, input_len);
         }}
-
-        ssize_t input_len = fread(buf, 1, {INPUT_SIZE}, fd);
-        if(input_len < 0) {{
-            perror("fread() error ");
-            return -1;
-        }}
-    
-        parser(shm, buf, (size_t)input_len);
     }} else {{
-        void **inputs = malloc(sizeof(void*) * 1024);
+        void **inputs = malloc(sizeof(void*) * 100000);
         size_t num_inputs = 0;
 
         input_len = {INPUT_SIZE};
@@ -263,7 +263,7 @@ main(int argc, char *argv[]) {{
                 memcpy(buf, inputs[sel], {INPUT_SIZE});
             }}
 
-            for(int ii = 0; ii < 2; ii++) {{
+            for(int ii = 0; ii < xorshift() % 8; ii++) {{
                 size_t sel = xorshift() % {INPUT_SIZE};
                 buf[sel] = xorshift();
             }}
@@ -273,11 +273,11 @@ main(int argc, char *argv[]) {{
             if(shm->coverage > old_cov) {{
                 uint8_t *cloned = calloc(1, {INPUT_SIZE});
                 memcpy(cloned, buf, {INPUT_SIZE});
-                if(num_inputs >= 1024) __builtin_trap();
+                if(num_inputs >= 100000) __builtin_trap();
                 inputs[num_inputs++] = cloned;
             }}
 
-            usleep(100);
+            //usleep(100);
         }}
     }}
 
@@ -285,27 +285,34 @@ main(int argc, char *argv[]) {{
     return 0;
 }}
 
-void parser(struct _shmem *shm, uint8_t *input, size_t input_size) {{
+void parser(volatile struct _shmem *shm, uint8_t *input, size_t input_size) {{
     uint64_t branches = 0;
 
-    shm->fuzz_cases += 1;
+    uint64_t cur_case = __sync_add_and_fetch(&shm->fuzz_cases, 1);
+    if(cur_case > 500000) {{
+        exit(0);
+    }}
+
 "#, INPUT_SIZE = INPUT_SIZE);
 
         for node in &self.nodes {
             // Generate a label for this node
             prog += &format!("node{}:\n", node.id.0);
 
-            prog += &format!("{{    uint64_t *cov = \
+            prog += &format!("{{    volatile uint64_t *cov = \
                 &shm->coverage_freqs[{}];\n",
                 node.id.0);
-            prog += "    if(*cov == 0) shm->coverage++;\n";
-            prog += "    *cov = *cov + 1;}\n";
+            prog += &format!("    if(__sync_fetch_and_add(cov, 1) == 0) {{ \
+                     __sync_bool_compare_and_swap(&shm->hit_on_case[{}], 0, \
+                        cur_case);
+                     __sync_fetch_and_add(&shm->coverage, 1); \
+            }}}}\n", node.id.0);
 
             // Emit conditionals
             for (tgt, cond) in &node.edge {
                 macro_rules! branch {
                     () => {
-                        prog += "    if(branches++ > 1000) return;\n";
+                        prog += "    if(branches++ > 10000) return;\n";
                         prog += &format!("    goto node{};\n", tgt.0);
                     }
                 }
@@ -468,7 +475,7 @@ pub enum Edge {
 }
 
 fn main() {
-    let graph = Graph::new_rand_cond_noloop(12);
+    let graph = Graph::new_rand_cond_noloop(500);
     graph.dump_svg("../coverage_server/foo.svg").unwrap();
     graph.generate_c("../afl_test/foo.c").unwrap();
 }
