@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io::Write;
 use std::net::TcpListener;
 use std::iter::once;
 use std::path::Path;
@@ -5,7 +7,7 @@ use std::sync::{Mutex, Arc};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, Duration};
 use std::error::Error;
-use std::process::Command;
+use std::process::{Stdio, Command};
 use std::collections::{BTreeSet, BTreeMap};
 use rand::random;
 use serde::Serialize;
@@ -70,9 +72,13 @@ struct NodeInfo {
     discovered: u64,
 }
 
-fn run_fuzzer(use_internal: bool) -> Result<(), Box<dyn Error>> {
+fn run_fuzzer(stat_prefix: &str, command: &'static [&'static str])
+        -> Result<(), Box<dyn Error>> {
     // Delete old shared memory
     let _ = std::fs::remove_file(SHM_FILENAME);
+
+    // Delete old outputs
+    let _ = std::fs::remove_dir_all("../afl_test/outputs");
     
     // Get access to shared memory
     let shmem = get_shmem(SHM_FILENAME);
@@ -85,24 +91,12 @@ fn run_fuzzer(use_internal: bool) -> Result<(), Box<dyn Error>> {
 
     // Create a new fuzzer instance
     threads.push(std::thread::spawn(move || {
-        let mut process = if use_internal {
-            Command::new("./a.out")
-                .current_dir("../afl_test")
-                .arg("internal").spawn().unwrap()
-        } else {
-            Command::new("/home/pleb/AFLplusplus/afl-fuzz")
-                .current_dir("../afl_test")
-                /*.arg("-p")
-                .arg("fast")*/
-                .arg("-d")
-                .arg("-i")
-                .arg("inputs")
-                .arg("-o")
-                .arg("outputs")
-                .arg("./a.out")
-                .arg("@@")
-                .spawn().unwrap()
-        };
+        let mut process = Command::new(command[0])
+            .current_dir("../afl_test")
+            .args(&command[1..])
+            .stderr(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn().unwrap();
 
         loop {
             if let Ok(Some(_status)) = process.try_wait() {
@@ -123,8 +117,6 @@ fn run_fuzzer(use_internal: bool) -> Result<(), Box<dyn Error>> {
         std::thread::sleep(Duration::from_millis(25));
     }
 
-    print!("First fuzz case detected\n");
-    
     // Create the data
     let global_data = Arc::new(Mutex::new(BTreeMap::new()));
 
@@ -138,7 +130,7 @@ fn run_fuzzer(use_internal: bool) -> Result<(), Box<dyn Error>> {
         loop {
             let last_shmem = shmem.clone();
 
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(5));
 
             let mut data = data.lock().unwrap();
 
@@ -146,9 +138,9 @@ fn run_fuzzer(use_internal: bool) -> Result<(), Box<dyn Error>> {
             let elapsed = start.elapsed().as_secs_f64();
             let cases = shmem.fuzz_cases.load(Ordering::Relaxed);
 
-            if last_status.elapsed() > Duration::from_millis(1000) {
-                print!("[{:10.3}] | cases {:10} [{:8.1}/sec] | \
-                       coverage {:10}\n",
+            if last_status.elapsed() > Duration::from_millis(25) {
+                eprint!("\r[{:10.3}] | cases {:12} [{:12.1}/sec] | \
+                       coverage {:10}",
                        elapsed,
                        cases, cases as f64 / elapsed,
                        shmem.coverage.load(Ordering::Relaxed));
@@ -181,7 +173,7 @@ fn run_fuzzer(use_internal: bool) -> Result<(), Box<dyn Error>> {
                     shmem.hit_on_case[ii].load(Ordering::Relaxed);
             }
 
-            if cases > 500_000 { 
+            if cases > 1_000_000 { 
                 // Request fuzzer to exit
                 let _ = sender.send(true);
                 return;
@@ -198,7 +190,7 @@ fn run_fuzzer(use_internal: bool) -> Result<(), Box<dyn Error>> {
         // Accept the connection
         let mut websocket = accept(stream?)?;
 
-        print!("Accepted connection\n");
+        eprint!("Accepted connection\n");
 
         // Handle messages forever
         let mut handler = || -> Result<(), Box<dyn Error>> {
@@ -218,40 +210,48 @@ fn run_fuzzer(use_internal: bool) -> Result<(), Box<dyn Error>> {
     for thr in threads {
         thr.join().unwrap();
     }
+
+    eprint!("\n");
     
     unsafe {
         libc::munmap(shmem as *const _ as *mut _, 0);
     }
 
-    let data_fn = if use_internal {
-        format!("data/internal_{:08x}.shm",
-            random::<u32>())
-    } else {
-        format!("data/afl_{:08x}.shm",
-            random::<u32>())
-    };
+    let data_fn = format!("data/{}_{:08x}.shm", stat_prefix, random::<u32>());
     std::fs::create_dir_all("data").unwrap();
     std::fs::copy(SHM_FILENAME, &data_fn).unwrap();
 
     Ok(())
 }
 
-fn process_data(prefix: &str) ->
-        Result<(
-            BTreeMap<usize, (f64, f64)>,
-            BTreeMap<usize, (f64, f64)>
-        ), Box<dyn Error>> {
+/// A structure that holds stats about a fuzzers performance
+#[derive(Default)]
+struct FuzzerStats {
+    /// Average number of cases to visit a given block
+    block_find: BTreeMap<usize, f64>,
+
+    /// Average number of times a block is hit
+    block_freq: BTreeMap<usize, f64>,
+}
+
+fn process_data(prefix: &str) -> Result<FuzzerStats, Box<dyn Error>> {
     if !Path::new("data").is_dir() {
         return Ok(Default::default());
     }
 
-    let mut time_to_bug = BTreeMap::new();
+    // Create a new stats structure
+    let mut stats = FuzzerStats::default();
+
+    // Create a mapping of blocks to the times to hit the block
+    let mut time_to_block = BTreeMap::new();
+    
+    // Create a mapping of blocks to the number of times the block was hit
     let mut num_hits = BTreeMap::new();
 
     // Go through each data file
     for filename in std::fs::read_dir("data")? {
+        // Filter based on the filename prefix we requested
         let filename = filename?.path();
-
         if !filename.file_name().unwrap().to_str().unwrap()
                 .starts_with(prefix) {
             continue;
@@ -264,7 +264,8 @@ fn process_data(prefix: &str) ->
         for (ii, blocks) in shmem.hit_on_case.iter().enumerate() {
             let blocks = blocks.load(Ordering::Relaxed);
             if blocks != 0 {
-                time_to_bug.entry(ii).or_insert_with(|| Vec::new()).push(blocks);
+                time_to_block.entry(ii)
+                    .or_insert_with(|| Vec::new()).push(blocks as f64);
             }
         }
         
@@ -272,137 +273,93 @@ fn process_data(prefix: &str) ->
         for (ii, freq) in shmem.coverage_freqs.iter().enumerate() {
             let freq = freq.load(Ordering::Relaxed);
             if freq != 0 {
-                num_hits.entry(ii).or_insert_with(|| Vec::new()).push(freq);
+                num_hits.entry(ii).or_insert_with(|| Vec::new())
+                    .push(freq as f64);
             }
         }
     }
+
+    // Compute means for each block
+    for (block, cases_to_hit) in time_to_block {
+        let total_hits = &num_hits[&block];
+
+        // Calcuate average cases to hit the block
+        let to_hit = cases_to_hit.iter().copied().sum::<f64>() /
+            cases_to_hit.len() as f64;
+
+        // Calculate average number of hits for the block
+        let num_hit = total_hits.iter().copied().sum::<f64>() /
+            total_hits.len() as f64;
+
+        // Update stat records
+        stats.block_find.insert(block, to_hit);
+        stats.block_freq.insert(block, num_hit);
+    }
     
-    let mut hits_mean_stddev = BTreeMap::new();
-    for (&block_id, hits) in num_hits.iter() {
-        // Compute the sum
-        let sum = hits.iter().map(|&x| x as f64)
-            .sum::<f64>();
-
-        // Compute the sum of squares
-        let sumx2 = hits.iter().map(|&x| x as f64 * x as f64)
-            .sum::<f64>();
-
-        // Compute the mean
-        let mean = sum / hits.len() as f64;
-
-        // Compute the stddev
-        let stddev =
-            ((sumx2 / hits.len() as f64) - (mean * mean)).sqrt();
-
-        hits_mean_stddev.insert(block_id, (mean, stddev));
-    }
-
-    let mut block_time_mean_stddev = BTreeMap::new();
-    for (&block_id, time_to_bug) in time_to_bug.iter() {
-        // Compute the sum
-        let sum = time_to_bug.iter().map(|&x| x as f64)
-            .sum::<f64>();
-
-        // Compute the sum of squares
-        let sumx2 = time_to_bug.iter().map(|&x| x as f64 * x as f64)
-            .sum::<f64>();
-
-        // Compute the mean
-        let mean = sum / time_to_bug.len() as f64;
-
-        // Compute the stddev
-        let stddev =
-            ((sumx2 / time_to_bug.len() as f64) - (mean * mean)).sqrt();
-
-        block_time_mean_stddev.insert(block_id, (mean, stddev));
-    }
-
-    Ok((block_time_mean_stddev, hits_mean_stddev))
+    Ok(stats)
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // First, remove all data
     let _ = std::fs::remove_dir_all("./data");
 
-    for _ in 0..25 {
-        run_fuzzer(false)?;
-    }
-    for _ in 0..25 {
-        run_fuzzer(true)?;
-    }
+    // Create a list of all fuzzers to test, and modes to use to test them
+    let mut fuzz_modes = [
+        ("internal-corrupt-1", &["./a.out", "internal", "1"][..], None),
+        ("internal-corrupt-2", &["./a.out", "internal", "2"][..], None),
+        ("internal-corrupt-4", &["./a.out", "internal", "4"][..], None),
+        ("internal-corrupt-8", &["./a.out", "internal", "8"][..], None),
+        ("internal-corrupt-16", &["./a.out", "internal", "16"][..], None),
+        ("internal-corrupt-32", &["./a.out", "internal", "32"][..], None),
+        ("internal-corrupt-64", &["./a.out", "internal", "64"][..], None),
 
-    {
-        let (internal_ttbdb, internal_hitsdb) = process_data("internal_")?;
-        let (afl_ttbdb, afl_hitsdb) = process_data("afl_")?;
+        ("afl-explore", &["/home/pleb/AFLplusplus/afl-fuzz",
+            "-p", "explore",
+            "-d", "-i", "inputs", "-o", "outputs", "./a.out", "@@"][..], None),
+        
+        ("afl-fast", &["/home/pleb/AFLplusplus/afl-fuzz",
+         "-p", "fast",
+         "-d", "-i", "inputs", "-o", "outputs", "./a.out", "@@"][..], None),
+    ];
 
-        let mut dot = std::fs::read_to_string("foo.dot")?;
+    // All unique blocks seen between all fuzzers and runs
+    let mut seen_blocks: BTreeSet<usize> = BTreeSet::new();
 
-        let keys: BTreeSet<_> = internal_ttbdb.keys().chain(afl_ttbdb.keys()).collect();
-        for &block_id in &keys {
-            let internal_ttb = internal_ttbdb.get(&block_id)
-                .unwrap_or(&(std::f64::MAX, std::f64::MAX));
-            let afl_ttb = afl_ttbdb.get(&block_id)
-                .unwrap_or(&(std::f64::MAX, std::f64::MAX));
-            
-            let internal_hits = internal_hitsdb.get(&block_id)
-                .unwrap_or(&(std::f64::MAX, std::f64::MAX));
-            let afl_hits = afl_hitsdb.get(&block_id)
-                .unwrap_or(&(std::f64::MAX, std::f64::MAX));
-
-            // Compute the AFL speedup, eg 2.0 means AFL took 1/2 the time to
-            // find the block
-            let afl_speedup = (internal_ttb.0 / afl_ttb.0).min(1000.);
-
-            // Compute the AFL hit ratio (2.0 means AFL visited the block 2x
-            // more than our fuzzer)
-            let afl_rate = (afl_hits.0 / internal_hits.0).min(1000.);
-
-            let ident = format!("id=\"node{}\"", block_id);
-
-            let ttb_fill = if afl_ttbdb.get(&block_id).is_none() &&
-                    internal_ttbdb.get(&block_id).is_some() {
-                // AFL was unable to find the block, but we were able to
-                "black".to_string()
-            } else if afl_ttbdb.get(&block_id).is_some() &&
-                    internal_ttbdb.get(&block_id).is_none() {
-                // AFL found the block and we did not
-                "blue".to_string()
-            } else if afl_speedup < 1.0 {
-                let intensity = ((1.0 - afl_speedup) * 1.5).min(1.0);
-                let intensity = intensity.max(0.2);
-                format!("0.000 {:5.3} 1.000", intensity)
-            } else {
-                let intensity = (afl_speedup / 3.).min(1.0);
-                let intensity = intensity.max(0.2);
-                format!("0.333 {:5.3} 1.000", intensity)
-            };
-            
-            let hit_fill = if afl_rate < 1.0 {
-                let intensity = ((1.0 - afl_rate) * 1.5).min(1.0);
-                let intensity = intensity.max(0.2);
-                format!("0.000 {:5.3} 1.000", intensity)
-            } else {
-                let intensity = (afl_rate / 3.).min(1.0);
-                let intensity = intensity.max(0.2);
-                format!("0.333 {:5.3} 1.000", intensity)
-            };
-
-            // Inner circle in the gradient is the ratio of time to hit
-            // Outer edges of gradient is the ratio of number of hits
-            let new = format!("id=\"node{}\",style=\"radial\",fillcolor=\"{}:{}\",label=\"{:.4} | {:.4}\"",
-                    block_id, ttb_fill, ttb_fill, afl_speedup, afl_rate);
-
-            dot = dot.replace(&ident, &new);
+    // Go through and run each fuzzer :D
+    for (prefix, use_internal, stats) in fuzz_modes.iter_mut() {
+        // Run the fuzzer
+        for ii in 0..20 {
+            eprint!("Iter {} of {}\n", ii, prefix);
+            run_fuzzer(prefix, *use_internal)?;
         }
 
-        std::fs::write("foo_colored.dot", dot)?;
+        // Process the results
+        let data = process_data(prefix)?;
 
-        assert!(Command::new("dot").args(&[
-            "-Tsvg",
-            "-ofoo_colored.svg",
-            "foo_colored.dot",
-        ]).status().unwrap().success());
+        // Update the IDs of the blocks we have observed
+        seen_blocks.extend(data.block_find.keys());
 
-        return Ok(());
+        // Update stats for this fuzzer
+        *stats = Some(data);
     }
+
+    let mut log = File::create("log.txt")?;
+    for fuzzer in &fuzz_modes {
+        write!(log, "\"{}\"\n", fuzzer.0)?;
+
+        // Generate some stats for each block for each fuzzer
+        for &block in &seen_blocks {
+            // Get the find rate for this fuzzer
+            let find = fuzzer.2.as_ref().unwrap().block_find.get(&block);
+            if find.is_none() { continue; }
+            let find = find.unwrap();
+
+            write!(log, "{:10} {:15.3}\n", block, find)?;
+        }
+
+        write!(log, "\n\n")?;
+    }
+
+    Ok(())
 }
 

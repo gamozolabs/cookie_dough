@@ -5,7 +5,7 @@ use std::collections::{VecDeque, BTreeSet};
 use rand::random;
 
 /// Max size of all fuzz inputs
-const INPUT_SIZE: usize = 512;
+const INPUT_SIZE: usize = 1024;
 
 /// The root node is always the 0th index in the node list
 const ROOT: NodeRef = NodeRef(0);
@@ -215,7 +215,7 @@ xorshift(void) {{
 
 int
 main(int argc, char *argv[]) {{
-    if(argc != 2) {{
+    if(argc < 2) {{
         printf("usage: %s <input filename>\n", argc > 0 ? argv[0] : "a.out");
         return -1;
     }}
@@ -252,6 +252,8 @@ main(int argc, char *argv[]) {{
         void **inputs = malloc(sizeof(void*) * 100000);
         size_t num_inputs = 0;
 
+        size_t corrupt_amount = atoi(argv[2]);
+
         input_len = {INPUT_SIZE};
 
         for( ; ; ) {{
@@ -263,7 +265,7 @@ main(int argc, char *argv[]) {{
                 memcpy(buf, inputs[sel], {INPUT_SIZE});
             }}
 
-            for(int ii = 0; ii < xorshift() % 8; ii++) {{
+            for(int ii = 0; ii < corrupt_amount; ii++) {{
                 size_t sel = xorshift() % {INPUT_SIZE};
                 buf[sel] = xorshift();
             }}
@@ -273,7 +275,7 @@ main(int argc, char *argv[]) {{
             if(shm->coverage > old_cov) {{
                 uint8_t *cloned = calloc(1, {INPUT_SIZE});
                 memcpy(cloned, buf, {INPUT_SIZE});
-                if(num_inputs >= 100000) __builtin_trap();
+                if(num_inputs >= 1000000) __builtin_trap();
                 inputs[num_inputs++] = cloned;
             }}
 
@@ -289,7 +291,7 @@ void parser(volatile struct _shmem *shm, uint8_t *input, size_t input_size) {{
     uint64_t branches = 0;
 
     uint64_t cur_case = __sync_add_and_fetch(&shm->fuzz_cases, 1);
-    if(cur_case > 500000) {{
+    if(cur_case > 1000000) {{
         exit(0);
     }}
 
@@ -312,7 +314,7 @@ void parser(volatile struct _shmem *shm, uint8_t *input, size_t input_size) {{
             for (tgt, cond) in &node.edge {
                 macro_rules! branch {
                     () => {
-                        prog += "    if(branches++ > 10000) return;\n";
+                        prog += "    if(branches++ > 1000) return;\n";
                         prog += &format!("    goto node{};\n", tgt.0);
                     }
                 }
@@ -475,8 +477,8 @@ pub enum Edge {
 }
 
 fn main() {
-    let graph = Graph::new_rand_cond_noloop(500);
-    graph.dump_svg("../coverage_server/foo.svg").unwrap();
+    let graph = Graph::new_rand_cond_noloop(1000);
+    //graph.dump_svg("../coverage_server/foo.svg").unwrap();
     graph.generate_c("../afl_test/foo.c").unwrap();
 }
 
