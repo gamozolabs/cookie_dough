@@ -2,13 +2,29 @@ use std::io;
 use std::path::Path;
 use std::process::Command;
 use std::collections::{VecDeque, BTreeSet};
-use rand::random;
+use rand::{Rng, SeedableRng};
+use rand::rngs::StdRng;
+
+/// Order to consume bytes from the input during graph construction
+const INPUT_ALLOCATION: InputAllocation = InputAllocation::Reverse;
 
 /// Max size of all fuzz inputs
-const INPUT_SIZE: usize = 1024;
+const INPUT_SIZE: usize = 8192;
 
 /// The root node is always the 0th index in the node list
 const ROOT: NodeRef = NodeRef(0);
+
+/// Different ways we can allocate from the input file
+pub enum InputAllocation {
+    /// Allocate bytes from the input file linearly
+    Linear,
+
+    /// Allocate bytes from the input file in reverse order
+    Reverse,
+
+    /// Allocate bytes from the input file in random order
+    Random,
+}
 
 /// An index into `nodes` for a graph
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -19,6 +35,13 @@ pub struct NodeRef(pub usize);
 pub struct Graph {
     /// Nodes in the graph
     nodes: Vec<Node>,
+
+    /// RNG to use for decisions about the graph or conditions for branches
+    shaperng: StdRng,
+
+    /// RNG to use for decisions about input byte index assignments to
+    /// conditional branches
+    inalcrng: StdRng,
 }
 
 impl Graph {
@@ -27,6 +50,8 @@ impl Graph {
         // Create an empty graph
         let mut graph = Graph {
             nodes: Vec::new(),
+            shaperng: StdRng::seed_from_u64(0x1337133713371337),
+            inalcrng: StdRng::seed_from_u64(1248218),
         };
 
         // Add a root node
@@ -52,30 +77,31 @@ impl Graph {
                 // Always link the root node first
                 ROOT.0
             } else {
-                random::<usize>() % graph.nodes.len()
+                graph.shaperng.gen::<usize>() % graph.nodes.len()
             };
 
-            let b = random::<usize>() % graph.nodes.len();
+            let b = graph.shaperng.gen::<usize>() % graph.nodes.len();
 
             // Generate a random condition
-            let condition = match random::<usize>() % 3 {
+            let condition = match graph.shaperng.gen::<u8>() % 3 {
                 0 => {
                     Edge::Unconditional
                 }
                 1 => {
-                    let min = random::<u8>();
+                    let min = graph.shaperng.gen();
                     Edge::InputU8 {
-                        idx: random::<usize>() % INPUT_SIZE,
+                        idx: graph.shaperng.gen(),
                         min: min,
-                        max: min + (random::<u16>() %
+                        max: min + (graph.shaperng.gen::<u16>() %
                             (std::u8::MAX as u16 - min as u16 + 1)) as u8,
                     }
                 }
                 2 => {
-                    let min = random::<usize>() % (INPUT_SIZE + 1);
+                    let min = graph.shaperng.gen::<usize>() % (INPUT_SIZE + 1);
                     Edge::InputSize {
                         min: min,
-                        max: min + random::<usize>() % (INPUT_SIZE + 1 - min),
+                        max: min + graph.shaperng.gen::<usize>() %
+                            (INPUT_SIZE + 1 - min),
                     }
                 }
                 _ => unreachable!(),
@@ -96,7 +122,10 @@ impl Graph {
         queue.push_back((0, ROOT));
 
         // Current input byte we are consuming
-        let mut cur_byte = 0;
+        let mut avail_bytes = BTreeSet::new();
+        for ii in 0..INPUT_SIZE {
+            avail_bytes.insert(ii);
+        }
 
         while let Some((depth, node)) = queue.pop_back() {
             if !visited.insert(node) { continue; }
@@ -107,20 +136,28 @@ impl Graph {
             });
             if reported.len() > num_nodes { continue; }
 
-            let min = random::<u8>();
-            assert!(cur_byte < INPUT_SIZE);
+            let min = graph.shaperng.gen();
+            assert!(avail_bytes.len() > 0);
+            let bsel = match INPUT_ALLOCATION {
+                InputAllocation::Linear  => 0,
+                InputAllocation::Reverse => avail_bytes.len() - 1,
+                InputAllocation::Random  => {
+                    graph.inalcrng.gen::<usize>() % avail_bytes.len()
+                }
+            };
+            let cur_byte = *avail_bytes.iter().nth(bsel).unwrap();
+            avail_bytes.remove(&cur_byte);
             let cond = Edge::InputU8 {
                 idx: cur_byte,
                 min: min,
-                max: min + (random::<u16>() %
+                max: min + (graph.shaperng.gen::<u16>() %
                     (std::u8::MAX as u16 - min as u16 + 1)) as u8,
             };
-            cur_byte += 1;
 
-            let ttgt = if random::<bool>() {
+            let ttgt = if graph.shaperng.gen() {
                 graph.add_node()
             } else {
-                NodeRef(random::<usize>() % graph.nodes.len())
+                NodeRef(graph.shaperng.gen::<usize>() % graph.nodes.len())
             };
 
             let ftgt = graph.add_node();
@@ -179,7 +216,7 @@ impl Graph {
         // Create an empty program
         let mut prog = String::new();
 
-        assert!(self.nodes.len() <= 1024,
+        assert!(self.nodes.len() <= 8192,
             "Too many nodes, update shmem->coverage_freqs");
 
         prog += &format!(r#"
@@ -192,13 +229,18 @@ impl Graph {
 #include <immintrin.h>
 #include <sys/mman.h>
 
+// Number of fuzz cases to perform before exiting
+static uint64_t NUM_FUZZ_CASES = 1000;
+
 __AFL_FUZZ_INIT();
 
 struct _shmem {{
     uint64_t fuzz_cases;
     uint64_t coverage;
-    uint64_t coverage_freqs[1024];
-    uint64_t hit_on_case[1024];
+    uint64_t start_time;
+    uint64_t coverage_freqs[8192];
+    uint64_t hit_on_case[8192];
+    uint64_t hit_on_time[8192];
 }};
 
 void parser(volatile struct _shmem *shmem, uint8_t *input, size_t input_size);
@@ -215,11 +257,14 @@ xorshift(void) {{
 
 int
 main(int argc, char *argv[]) {{
-    if(argc < 2) {{
-        printf("usage: %s <input filename>\n", argc > 0 ? argv[0] : "a.out");
+    if(argc < 3) {{
+        printf("usage: %s <num cases> <input filename>\n", argc > 0 ? argv[0] : "a.out");
         return -1;
     }}
-    
+
+    // Parse number of fuzz cases
+    NUM_FUZZ_CASES = atoi(argv[1]);
+
     uint8_t *buf = calloc(1, {INPUT_SIZE});
     size_t input_len = 0;
     if(!buf) {{
@@ -242,7 +287,7 @@ main(int argc, char *argv[]) {{
         return -1;
     }}
     
-    if(strcmp(argv[1], "internal")) {{
+    if(strcmp(argv[2], "internal")) {{
         while(__AFL_LOOP(100000)) {{
             buf = __AFL_FUZZ_TESTCASE_BUF;
             size_t input_len = __AFL_FUZZ_TESTCASE_LEN;
@@ -252,7 +297,7 @@ main(int argc, char *argv[]) {{
         void **inputs = malloc(sizeof(void*) * 100000);
         size_t num_inputs = 0;
 
-        size_t corrupt_amount = atoi(argv[2]);
+        size_t corrupt_amount = atoi(argv[3]);
 
         input_len = {INPUT_SIZE};
 
@@ -276,7 +321,8 @@ main(int argc, char *argv[]) {{
                 uint8_t *cloned = calloc(1, {INPUT_SIZE});
                 memcpy(cloned, buf, {INPUT_SIZE});
                 if(num_inputs >= 1000000) __builtin_trap();
-                inputs[num_inputs++] = cloned;
+                size_t iid = num_inputs++;
+                inputs[iid] = cloned;
             }}
 
             //usleep(100);
@@ -291,7 +337,7 @@ void parser(volatile struct _shmem *shm, uint8_t *input, size_t input_size) {{
     uint64_t branches = 0;
 
     uint64_t cur_case = __sync_add_and_fetch(&shm->fuzz_cases, 1);
-    if(cur_case > 1000000) {{
+    if(cur_case > NUM_FUZZ_CASES) {{
         exit(0);
     }}
 
@@ -307,14 +353,16 @@ void parser(volatile struct _shmem *shm, uint8_t *input, size_t input_size) {{
             prog += &format!("    if(__sync_fetch_and_add(cov, 1) == 0) {{ \
                      __sync_bool_compare_and_swap(&shm->hit_on_case[{}], 0, \
                         cur_case);
+                     __sync_bool_compare_and_swap(&shm->hit_on_time[{}], 0, \
+                        __rdtsc() - shm->start_time);
                      __sync_fetch_and_add(&shm->coverage, 1); \
-            }}}}\n", node.id.0);
+            }}}}\n", node.id.0, node.id.0);
 
             // Emit conditionals
             for (tgt, cond) in &node.edge {
                 macro_rules! branch {
                     () => {
-                        prog += "    if(branches++ > 1000) return;\n";
+                        prog += "    if(branches++ > 10000) return;\n";
                         prog += &format!("    goto node{};\n", tgt.0);
                     }
                 }
@@ -477,7 +525,7 @@ pub enum Edge {
 }
 
 fn main() {
-    let graph = Graph::new_rand_cond_noloop(1000);
+    let graph = Graph::new_rand_cond_noloop(2000);
     //graph.dump_svg("../coverage_server/foo.svg").unwrap();
     graph.generate_c("../afl_test/foo.c").unwrap();
 }

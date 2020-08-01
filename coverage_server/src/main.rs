@@ -1,6 +1,5 @@
 use std::fs::File;
 use std::io::Write;
-use std::net::TcpListener;
 use std::iter::once;
 use std::path::Path;
 use std::sync::{Mutex, Arc};
@@ -8,38 +7,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, Duration};
 use std::error::Error;
 use std::process::{Stdio, Command};
-use std::collections::{BTreeSet, BTreeMap};
-use rand::random;
-use serde::Serialize;
-use tungstenite::Message;
-use tungstenite::server::accept;
+use std::collections::{BTreeMap, VecDeque};
 
-const SHM_FILENAME: &'static str = "../afl_test/shared_memory.shm";
-
+/// Shared memory in use by the fuzzed target
 #[repr(C)]
 struct Shmem {
     fuzz_cases:     AtomicU64,
     coverage:       AtomicU64,
-    coverage_freqs: [AtomicU64; 1024],
-    hit_on_case:    [AtomicU64; 1024],
+    start_time:     AtomicU64,
+    coverage_freqs: [AtomicU64; 8192],
+    hit_on_case:    [AtomicU64; 8192],
+    hit_on_rdtsc:   [AtomicU64; 8192],
 }
 
-impl Clone for Shmem {
-    fn clone(&self) -> Self {
-        let tmp: Shmem = unsafe { core::mem::zeroed() };
-        tmp.fuzz_cases.store(
-            self.fuzz_cases.load(Ordering::Relaxed), Ordering::Relaxed);
-        tmp.coverage.store(
-            self.coverage.load(Ordering::Relaxed), Ordering::Relaxed);
-        for (new, old) in tmp.coverage_freqs.iter()
-                .zip(self.coverage_freqs.iter()) {
-            new.store(old.load(Ordering::Relaxed), Ordering::Relaxed);
-        }
-
-        tmp
-    }
-}
-
+/// Get access to shared memory
 fn get_shmem<P: AsRef<Path>>(filename: P) -> &'static Shmem {
     use libc::*;
 
@@ -65,299 +46,353 @@ fn get_shmem<P: AsRef<Path>>(filename: P) -> &'static Shmem {
     }
 }
 
-#[derive(Serialize)]
-struct NodeInfo {
-    color:      u8,
-    coverage:   u64,
-    discovered: u64,
+/// A structure that holds stats about a fuzzers performance
+#[derive(Default, Debug)]
+struct FuzzerStats {
+    /// Number of cases to visit a given block
+    block_find: BTreeMap<usize, u64>,
+    
+    /// rdtsc time to visit a given block
+    block_rdtsc: BTreeMap<usize, u64>,
+
+    /// Number of times a block is hit
+    block_freq: BTreeMap<usize, u64>,
 }
 
-fn run_fuzzer(stat_prefix: &str, command: &'static [&'static str])
-        -> Result<(), Box<dyn Error>> {
-    // Delete old shared memory
-    let _ = std::fs::remove_file(SHM_FILENAME);
+fn process_data(shmem: &Shmem) -> Result<FuzzerStats, Box<dyn Error>> {
+    // Create a new stats structure
+    let mut stats = FuzzerStats::default();
 
-    // Delete old outputs
-    let _ = std::fs::remove_dir_all("../afl_test/outputs");
+    // Log the cases it took to find coverage 
+    for (ii, blocks) in shmem.hit_on_case.iter().enumerate() {
+        let blocks = blocks.load(Ordering::Relaxed);
+        if blocks != 0 {
+            assert!(stats.block_find.insert(ii, blocks).is_none());
+        }
+    }
+    
+    for (ii, blocks) in shmem.hit_on_rdtsc.iter().enumerate() {
+        let blocks = blocks.load(Ordering::Relaxed);
+        if blocks != 0 {
+            assert!(stats.block_rdtsc.insert(ii, blocks).is_none());
+        }
+    }
+    
+    for (ii, blocks) in shmem.coverage_freqs.iter().enumerate() {
+        let blocks = blocks.load(Ordering::Relaxed);
+        if blocks != 0 {
+            assert!(stats.block_freq.insert(ii, blocks).is_none());
+        }
+    }
+
+    Ok(stats)
+}
+
+/// A structure which holds information about a fuzz runs progress and speed
+struct FuzzerProgress {
+    /// Number of cases for the fuzzer
+    cases: u64,
+
+    /// Amount of coverage the fuzzer has explored
+    coverage: u64,
+
+    /// The time when the fuzzer started running
+    start_time: Option<Instant>,
+
+    /// Upon successful execution of the fuzzer, this will be populated with
+    /// the information about the fuzz run
+    stats: Option<FuzzerStats>,
+}
+
+fn worker(name: String, id: usize, command: &[&str],
+          progress: Arc<Mutex<FuzzerProgress>>) {
+    // Create job directory
+    let job_dir = Path::new("temps").join(&format!("{}-{}", name, id));
+    std::fs::create_dir_all(&job_dir).unwrap();
+
+    // Create paths
+    let shm_path = job_dir.join("shared_memory.shm");
+    let inputs   = job_dir.join("inputs");
+    let outputs  = job_dir.join("outputs");
+    let aout     = job_dir.join("a.out");
+    let afl      = job_dir.join("afl-fuzz");
+    std::fs::create_dir_all(&inputs).unwrap();
+    std::fs::create_dir_all(&outputs).unwrap();
     
     // Get access to shared memory
-    let shmem = get_shmem(SHM_FILENAME);
+    let shmem = get_shmem(&shm_path);
+    if shmem.fuzz_cases.load(Ordering::Relaxed) > 0 {
+        // Stats already present, we're just analyzing
+        
+        // Parse the stats
+        let stats = process_data(shmem).unwrap();
+        
+        // Unmap shared memory
+        unsafe {
+            libc::munmap(shmem as *const _ as *mut _, 0);
+        }
 
-    // Keeps track of threads we spawn
-    let mut threads = Vec::new();
+        // Save the stats
+        progress.lock().unwrap().stats = Some(stats);
+        return;
+    }
+
+    // Copy the binaries
+    std::fs::copy("../afl_test/a.out", &aout).unwrap();
+    std::fs::copy("/home/pleb/AFLplusplus/afl-fuzz", &afl).unwrap();
+
+    // Create a template input file for AFL to build on
+    std::fs::write(inputs.join("test_input"), vec![0u8; 8192]).unwrap();
     
-    // Create a channel for signalling when to exit the fuzzer
-    let (sender, receiver) = std::sync::mpsc::channel();
+    unsafe {
+        // For some reason we get an ETEXTBUSY if we don't wait a bit here
+        // or sync out the writes of the a.out
+        libc::sync();
+
+        // Update start time for the fuzzer
+        shmem.start_time.store(
+            core::arch::x86_64::_rdtsc(), Ordering::SeqCst);
+    }
+
+    {
+        // Fuzz start timer
+        progress.lock().unwrap().start_time = Some(Instant::now());
+    }
 
     // Create a new fuzzer instance
-    threads.push(std::thread::spawn(move || {
-        let mut process = Command::new(command[0])
-            .current_dir("../afl_test")
-            .args(&command[1..])
-            .stderr(Stdio::null())
-            .stdout(Stdio::null())
-            .spawn().unwrap();
+    let mut process = Command::new(command[0])
+        .current_dir(job_dir)
+        .env("AFL_NO_AFFINITY", "1")
+        .env("AFL_SKIP_CPUFREQ", "1")
+        .args(&command[1..])
+        .stderr(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn().unwrap();
 
-        loop {
-            if let Ok(Some(_status)) = process.try_wait() {
-                break;
-            }
-
-            if let Ok(_) = receiver.try_recv() {
-                Command::new("killall").arg("-9").arg("a.out")
-                    .status().unwrap();
-            }
-
-            std::thread::sleep(Duration::from_millis(10));
+    loop {
+        if let Some(_) = process.try_wait().unwrap() {
+            break;
         }
-    }));
 
-    // Don't start until the first fuzz case
-    while shmem.fuzz_cases.load(Ordering::Relaxed) == 0 {
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Update progress of the fuzzer
+        let mut prog = progress.lock().unwrap();
+        prog.cases    = shmem.fuzz_cases.load(Ordering::Relaxed);
+        prog.coverage = shmem.coverage.load(Ordering::Relaxed);
     }
 
-    // Create the data
-    let global_data = Arc::new(Mutex::new(BTreeMap::new()));
-
-    // Start a stats thread
-    let data = global_data.clone();
-    threads.push(std::thread::spawn(move || {
-        // Start a timer
-        let start = Instant::now();
-
-        let mut last_status = Instant::now();
-        loop {
-            let last_shmem = shmem.clone();
-
-            std::thread::sleep(Duration::from_millis(5));
-
-            let mut data = data.lock().unwrap();
-
-            // Get elapsed time
-            let elapsed = start.elapsed().as_secs_f64();
-            let cases = shmem.fuzz_cases.load(Ordering::Relaxed);
-
-            if last_status.elapsed() > Duration::from_millis(25) {
-                eprint!("\r[{:10.3}] | cases {:12} [{:12.1}/sec] | \
-                       coverage {:10}",
-                       elapsed,
-                       cases, cases as f64 / elapsed,
-                       shmem.coverage.load(Ordering::Relaxed));
-                last_status = Instant::now();
-            }
-
-            for (ii, (old, new)) in last_shmem.coverage_freqs.iter()
-                    .zip(shmem.coverage_freqs.iter()).enumerate() {
-                let new = new.load(Ordering::Relaxed);
-                let old = old.load(Ordering::Relaxed);
-                if new == 0 { continue; }
-
-                let ent = data.entry(format!("node{}", ii))
-                    .or_insert(NodeInfo {
-                        color: 100,
-                        coverage: 0,
-                        discovered: 0,
-                    });
-
-                if new > old {
-                    // Update color on new coverage
-                    ent.color = 70;
-                } else {
-                    ent.color = core::cmp::min(ent.color + 1, 90);
-                }
-
-                // Update coverage
-                ent.coverage = new;
-                ent.discovered =
-                    shmem.hit_on_case[ii].load(Ordering::Relaxed);
-            }
-
-            if cases > 1_000_000 { 
-                // Request fuzzer to exit
-                let _ = sender.send(true);
-                return;
-            }
-        }
-    }));
-
-    /*
-    // Create the server
-    let server = TcpListener::bind("127.0.0.1:9001")?;
-
-    // Wait for connections
-    for stream in server.incoming() {
-        // Accept the connection
-        let mut websocket = accept(stream?)?;
-
-        eprint!("Accepted connection\n");
-
-        // Handle messages forever
-        let mut handler = || -> Result<(), Box<dyn Error>> {
-            loop {
-                std::thread::sleep(Duration::from_millis(100));
- 
-                websocket.write_message(
-                    Message::Text(serde_json::to_string(
-                            &*global_data.lock().unwrap())?))?;
-            }
-        };
-
-        let _ = handler();
-    }*/
-
-    // Wait for all threads to exit
-    for thr in threads {
-        thr.join().unwrap();
-    }
-
-    eprint!("\n");
+    // Parse the stats
+    let stats = process_data(shmem).unwrap();
     
+    // Unmap shared memory
     unsafe {
         libc::munmap(shmem as *const _ as *mut _, 0);
     }
 
-    let data_fn = format!("data/{}_{:08x}.shm", stat_prefix, random::<u32>());
-    std::fs::create_dir_all("data").unwrap();
-    std::fs::copy(SHM_FILENAME, &data_fn).unwrap();
-
-    Ok(())
-}
-
-/// A structure that holds stats about a fuzzers performance
-#[derive(Default)]
-struct FuzzerStats {
-    /// Average number of cases to visit a given block
-    block_find: BTreeMap<usize, f64>,
-
-    /// Average number of times a block is hit
-    block_freq: BTreeMap<usize, f64>,
-}
-
-fn process_data(prefix: &str) -> Result<FuzzerStats, Box<dyn Error>> {
-    if !Path::new("data").is_dir() {
-        return Ok(Default::default());
-    }
-
-    // Create a new stats structure
-    let mut stats = FuzzerStats::default();
-
-    // Create a mapping of blocks to the times to hit the block
-    let mut time_to_block = BTreeMap::new();
-    
-    // Create a mapping of blocks to the number of times the block was hit
-    let mut num_hits = BTreeMap::new();
-
-    // Go through each data file
-    for filename in std::fs::read_dir("data")? {
-        // Filter based on the filename prefix we requested
-        let filename = filename?.path();
-        if !filename.file_name().unwrap().to_str().unwrap()
-                .starts_with(prefix) {
-            continue;
-        }
-       
-        // Load the data file
-        let shmem = get_shmem(filename);
-
-        // Log the time it took to find coverage 
-        for (ii, blocks) in shmem.hit_on_case.iter().enumerate() {
-            let blocks = blocks.load(Ordering::Relaxed);
-            if blocks != 0 {
-                time_to_block.entry(ii)
-                    .or_insert_with(|| Vec::new()).push(blocks as f64);
-            }
-        }
-        
-        // Log the number of hits per block
-        for (ii, freq) in shmem.coverage_freqs.iter().enumerate() {
-            let freq = freq.load(Ordering::Relaxed);
-            if freq != 0 {
-                num_hits.entry(ii).or_insert_with(|| Vec::new())
-                    .push(freq as f64);
-            }
-        }
-    }
-
-    // Compute means for each block
-    for (block, cases_to_hit) in time_to_block {
-        let total_hits = &num_hits[&block];
-
-        // Calcuate average cases to hit the block
-        let to_hit = cases_to_hit.iter().copied().sum::<f64>() /
-            cases_to_hit.len() as f64;
-
-        // Calculate average number of hits for the block
-        let num_hit = total_hits.iter().copied().sum::<f64>() /
-            total_hits.len() as f64;
-
-        // Update stat records
-        stats.block_find.insert(block, to_hit);
-        stats.block_freq.insert(block, num_hit);
-    }
-    
-    Ok(stats)
+    // Save the stats
+    progress.lock().unwrap().stats = Some(stats);
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // First, remove all data
-    let _ = std::fs::remove_dir_all("./data");
+    /// Number of times to run each fuzzer to average data over
+    const NUM_AVERAGES: usize = 100;
 
-    // Create a list of all fuzzers to test, and modes to use to test them
-    let mut fuzz_modes = [
-        ("internal-corrupt-1", &["./a.out", "internal", "1"][..], None),
-        ("internal-corrupt-2", &["./a.out", "internal", "2"][..], None),
-        ("internal-corrupt-4", &["./a.out", "internal", "4"][..], None),
-        ("internal-corrupt-8", &["./a.out", "internal", "8"][..], None),
-        ("internal-corrupt-16", &["./a.out", "internal", "16"][..], None),
-        ("internal-corrupt-32", &["./a.out", "internal", "32"][..], None),
-        ("internal-corrupt-64", &["./a.out", "internal", "64"][..], None),
-
-        ("afl-explore", &["/home/pleb/AFLplusplus/afl-fuzz",
-            "-p", "explore",
-            "-d", "-i", "inputs", "-o", "outputs", "./a.out", "@@"][..], None),
+    /// Number of fuzz cases to perform before exiting the fuzzer
+    const NUM_CASES: &'static str = "5000000";
+    
+    // Remove all temporary directories
+    //let _ = std::fs::remove_dir_all("./temps");
+    
+    // All the different fuzzers we want to explore
+    // This holds the name of the fuzz job and the command to invoke to run
+    // the fuzzer
+    let fuzz_modes = [
+        ("internal-corrupt-1", &["./a.out", NUM_CASES, "internal", "1"][..]),
+        ("internal-corrupt-2", &["./a.out", NUM_CASES, "internal", "2"][..]),
+        ("internal-corrupt-4", &["./a.out", NUM_CASES, "internal", "4"][..]),
+        ("internal-corrupt-8", &["./a.out", NUM_CASES, "internal", "8"][..]),
+        ("internal-corrupt-16", &["./a.out", NUM_CASES, "internal", "16"][..]),
+        ("internal-corrupt-32", &["./a.out", NUM_CASES, "internal", "32"][..]),
+        ("internal-corrupt-64", &["./a.out", NUM_CASES, "internal", "64"][..]),
         
-        ("afl-fast", &["/home/pleb/AFLplusplus/afl-fuzz",
+        ("afl-explore", &["./afl-fuzz",
+            "-p", "explore",
+            "-d", "-E", NUM_CASES, "-i", "inputs", "-o", "outputs",
+            "./a.out", NUM_CASES, "@@"][..]),
+        
+        ("afl-fast", &["./afl-fuzz",
          "-p", "fast",
-         "-d", "-i", "inputs", "-o", "outputs", "./a.out", "@@"][..], None),
+         "-d", "-E", NUM_CASES, "-i", "inputs", "-o", "outputs", "./a.out",
+         NUM_CASES, "@@"][..]),
     ];
 
-    // All unique blocks seen between all fuzzers and runs
-    let mut seen_blocks: BTreeSet<usize> = BTreeSet::new();
-
-    // Go through and run each fuzzer :D
-    for (prefix, use_internal, stats) in fuzz_modes.iter_mut() {
-        // Run the fuzzer
-        for ii in 0..20 {
-            eprint!("Iter {} of {}\n", ii, prefix);
-            run_fuzzer(prefix, *use_internal)?;
+    // Tracks which fuzzer should be run
+    let mut to_run = VecDeque::new();
+    for run_id in 0..NUM_AVERAGES {
+        for (name, command) in &fuzz_modes {
+            let progress = Arc::new(Mutex::new(FuzzerProgress {
+                cases:      0,
+                coverage:   0,
+                start_time: None,
+                stats:      None,
+            }));
+            to_run.push_back(
+                (name.to_string(), run_id, *command, progress));
         }
-
-        // Process the results
-        let data = process_data(prefix)?;
-
-        // Update the IDs of the blocks we have observed
-        seen_blocks.extend(data.block_find.keys());
-
-        // Update stats for this fuzzer
-        *stats = Some(data);
     }
 
-    let mut log = File::create("log.txt")?;
-    for fuzzer in &fuzz_modes {
-        write!(log, "\"{}\"\n", fuzzer.0)?;
+    // Tracks which fuzzers are running
+    let mut running: Vec<(String, usize, &[&str], Arc<Mutex<FuzzerProgress>>)>=
+        Vec::new();
 
-        // Generate some stats for each block for each fuzzer
-        for &block in &seen_blocks {
-            // Get the find rate for this fuzzer
-            let find = fuzzer.2.as_ref().unwrap().block_find.get(&block);
-            if find.is_none() { continue; }
-            let find = find.unwrap();
+    // Holds complete fuzz jobs
+    let mut complete = Vec::new();
+    let mut last_done = 0.;
 
-            write!(log, "{:10} {:15.3}\n", block, find)?;
+    // Keep track of the status last print time
+    let start_time = Instant::now();
+    let mut last_print = Instant::now();
+    'done_running: loop {
+        // Wait for us to have some threads available
+        while running.len() >= 250 || to_run.len() == 0 {
+            std::thread::sleep(Duration::from_millis(50));
+
+            // Remove any running process if it has completed, indicated by
+            // the `stats` field being populated
+            let print_status = if last_print.elapsed().as_secs_f64() > 1.0 {
+                print!("\x1b[2J");
+                last_print = Instant::now();
+                true
+            } else {
+                false
+            };
+
+            let num_cases = NUM_CASES.parse::<f64>().unwrap();
+            let mut done_cases = num_cases * complete.len() as f64;
+
+            // Compute total number of cases we need to complete
+            let total_cases = num_cases * fuzz_modes.len() as f64 *
+                NUM_AVERAGES as f64;
+
+            running.retain(|job| {
+                let mut progress = job.3.lock().unwrap();
+                if progress.stats.is_none() {
+                    // Job has just barely started, process not spawned yet
+                    if progress.start_time.is_none() { return true; }
+
+                    // Get the time since we statred the job
+                    let elapsed = progress.start_time.unwrap().elapsed()
+                        .as_secs_f64();
+
+                    // Job is still running
+                    if print_status {
+                        print!("Job {:25} {:4} | uptime {:6.1} | \
+                                cases {:10} | cov {:5}\n",
+                            job.0, job.1, elapsed, progress.cases,
+                            progress.coverage);
+
+                        // Update total number of cases
+                        done_cases += progress.cases as f64;
+                    }
+
+                    true
+                } else {
+                    // Job is done, save the complete information and remove
+                    // it from the running list
+                    complete.push((job.0.clone(),
+                        progress.stats.take().unwrap()));
+                    false
+                }
+            });
+                
+            if print_status {
+                let prog = done_cases / total_cases;
+                let mps  = (done_cases - last_done) / 1e6;
+                print!("[{:7.1}] | {:8.3} M of {:8.3} M [{:6.2} M/sec] \
+                        [{:5.4}] | {:5.0} sec remain\n",
+                    start_time.elapsed().as_secs_f64(),
+                    done_cases / 1e6, total_cases / 1e6,
+                    mps, prog, (total_cases - done_cases) / 1e6 / mps);
+
+                last_done = done_cases;
+            }
+
+            if to_run.len() == 0 && running.len() == 0 {
+                // All done with jobs
+                break 'done_running;
+            }
         }
 
-        write!(log, "\n\n")?;
+        // Get the job job
+        let next_schedule = to_run.pop_front().unwrap();
+
+        // Run the job
+        let name = next_schedule.0.clone();
+        let id   = next_schedule.1;
+        let cmd  = next_schedule.2;
+        let prog = next_schedule.3.clone();
+        std::thread::spawn(move || {
+            worker(name, id, cmd, prog);
+        });
+
+        // Put the job into the running job list
+        running.push(next_schedule);
+    }
+
+    #[derive(Default)]
+    struct Stat {
+        find:  BTreeMap<usize, Vec<u64>>,
+        rdtsc: BTreeMap<usize, Vec<u64>>,
+    }
+
+    // All jobs complete, create summary buckets
+    let mut summary = BTreeMap::new();
+    for (name, stats) in complete {
+        let stat = summary.entry(name.to_string())
+            .or_insert_with(|| Stat::default());
+
+        for (&blkid, &val) in &stats.block_find {
+            let ent = stat.find.entry(blkid).or_insert(Vec::new());
+            ent.push(val);
+            ent.sort_by_key(|&x| x);
+        }
+        for (&blkid, &val) in &stats.block_rdtsc {
+            let ent = stat.rdtsc.entry(blkid).or_insert(Vec::new());
+            ent.push(val);
+            ent.sort_by_key(|&x| x);
+        }
+    }
+
+    // Create graph file
+    let mut outfd = File::create("log.txt").unwrap();
+
+    for (name, stat) in summary.iter_mut() {
+        // Name header for data
+        write!(outfd, "\n\n{}\n", name).unwrap();
+
+        for block in stat.find.keys() {
+            // Get the arrays of find and rdtsc times
+            let find  = &stat.find[block];
+            let rdtsc = &stat.rdtsc[block];
+
+            let med_find  = find[find.len()   / 2];
+            let med_rdtsc = rdtsc[rdtsc.len() / 2];
+
+            let sum_find  = find.iter().map(|&x| x as f64).sum::<f64>();
+            let sum2_find = find.iter().map(|&x|
+                    x as f64 * x as f64).sum::<f64>();
+            let mean_find = sum_find / find.len() as f64;
+            let std_find  =
+                ((sum2_find / find.len() as f64) -
+                 (mean_find * mean_find)).sqrt();
+
+            write!(outfd, "{:5} {:20} {:20.2} {:20.2} {:20} {:10}\n",
+                   block,
+                   med_find, mean_find, std_find,
+                   med_rdtsc,
+                   find.len()).unwrap();
+        }
     }
 
     Ok(())
