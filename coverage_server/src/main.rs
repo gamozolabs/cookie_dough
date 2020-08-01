@@ -139,7 +139,7 @@ fn worker(name: String, id: usize, command: &[&str],
 
     // Copy the binaries
     std::fs::copy("../afl_test/a.out", &aout).unwrap();
-    std::fs::copy("/home/pleb/AFLplusplus/afl-fuzz", &afl).unwrap();
+    std::fs::copy("../../AFLplusplus/afl-fuzz", &afl).unwrap();
 
     // Create a template input file for AFL to build on
     std::fs::write(inputs.join("test_input"), vec![0u8; 8192]).unwrap();
