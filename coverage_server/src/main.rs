@@ -164,22 +164,27 @@ fn worker(name: String, id: usize, command: &[&str],
         .current_dir(job_dir)
         .env("AFL_NO_AFFINITY", "1")
         .env("AFL_SKIP_CPUFREQ", "1")
+        .env("AFL_DISABLE_TRIM", "1")
         .args(&command[1..])
         .stderr(Stdio::null())
         .stdout(Stdio::null())
         .spawn().unwrap();
 
+    let mut start = Instant::now();
+    let mut log = File::create(format!("{}.log.txt", name)).unwrap();
     loop {
         if let Some(_) = process.try_wait().unwrap() {
             break;
         }
 
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(1));
 
         // Update progress of the fuzzer
         let mut prog = progress.lock().unwrap();
         prog.cases    = shmem.fuzz_cases.load(Ordering::Relaxed);
         prog.coverage = shmem.coverage.load(Ordering::Relaxed);
+
+        write!(log, "{:10.6} {:10} {:10}\n", start.elapsed().as_secs_f64(), prog.coverage, prog.cases).unwrap();
     }
 
     // Parse the stats
@@ -196,10 +201,10 @@ fn worker(name: String, id: usize, command: &[&str],
 
 fn main() -> Result<(), Box<dyn Error>> {
     /// Number of times to run each fuzzer to average data over
-    const NUM_AVERAGES: usize = 100;
+    const NUM_AVERAGES: usize = 1;
 
     /// Number of fuzz cases to perform before exiting the fuzzer
-    const NUM_CASES: &'static str = "5000000";
+    const NUM_CASES: &'static str = "100000000";
     
     // Remove all temporary directories
     //let _ = std::fs::remove_dir_all("./temps");
@@ -216,15 +221,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         ("internal-corrupt-32", &["./a.out", NUM_CASES, "internal", "32"][..]),
         ("internal-corrupt-64", &["./a.out", NUM_CASES, "internal", "64"][..]),
         
+        /*
         ("afl-explore", &["./afl-fuzz",
             "-p", "explore",
             "-d", "-E", NUM_CASES, "-i", "inputs", "-o", "outputs",
             "./a.out", NUM_CASES, "@@"][..]),
-        
         ("afl-fast", &["./afl-fuzz",
          "-p", "fast",
          "-d", "-E", NUM_CASES, "-i", "inputs", "-o", "outputs", "./a.out",
-         NUM_CASES, "@@"][..]),
+         NUM_CASES, "@@"][..]),*/
     ];
 
     // Tracks which fuzzer should be run
@@ -367,10 +372,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Create graph file
     let mut outfd = File::create("log.txt").unwrap();
 
+    let cases: u64 = NUM_CASES.parse().unwrap();
     for (name, stat) in summary.iter_mut() {
         // Name header for data
         write!(outfd, "\n\n{}\n", name).unwrap();
 
+        for case in (0..cases).step_by(100) {
+            let coverage = stat.find.iter().filter(|(_, found)| case >= found[0]).count();
+            write!(outfd, "{:10} {:10}\n", case, coverage).unwrap();
+        }
+
+        /*
         for block in stat.find.keys() {
             // Get the arrays of find and rdtsc times
             let find  = &stat.find[block];
@@ -392,7 +404,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                    med_find, mean_find, std_find,
                    med_rdtsc,
                    find.len()).unwrap();
-        }
+        }*/
     }
 
     Ok(())

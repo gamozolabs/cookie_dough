@@ -24,6 +24,10 @@ pub enum InputAllocation {
 
     /// Allocate bytes from the input file in random order
     Random,
+
+    /// Allocate bytes in reverse order using 17 as a skip between them,
+    /// modulo the input size
+    ReversePrime17,
 }
 
 /// An index into `nodes` for a graph
@@ -127,6 +131,8 @@ impl Graph {
             avail_bytes.insert(ii);
         }
 
+        let mut target_byte = INPUT_SIZE - 1;
+
         while let Some((depth, node)) = queue.pop_back() {
             if !visited.insert(node) { continue; }
         
@@ -138,15 +144,35 @@ impl Graph {
 
             let min = graph.shaperng.gen();
             assert!(avail_bytes.len() > 0);
-            let bsel = match INPUT_ALLOCATION {
-                InputAllocation::Linear  => 0,
-                InputAllocation::Reverse => avail_bytes.len() - 1,
+            let cur_byte = match INPUT_ALLOCATION {
+                InputAllocation::Linear  => {
+                    let cur_byte = *avail_bytes.iter().nth(0).unwrap();
+                    avail_bytes.remove(&cur_byte);
+                    cur_byte
+                }
+                InputAllocation::Reverse => {
+                    let cur_byte = *avail_bytes.iter()
+                        .nth(avail_bytes.len() - 1).unwrap();
+                    avail_bytes.remove(&cur_byte);
+                    cur_byte
+                }
                 InputAllocation::Random  => {
-                    graph.inalcrng.gen::<usize>() % avail_bytes.len()
+                    let sel =
+                        graph.inalcrng.gen::<usize>() % avail_bytes.len();
+                    let cur_byte = *avail_bytes.iter().nth(sel).unwrap();
+                    avail_bytes.remove(&cur_byte);
+                    cur_byte
+                }
+                InputAllocation::ReversePrime17 => {
+                    loop {
+                        target_byte = target_byte.wrapping_add(7);
+                        target_byte = target_byte % INPUT_SIZE;
+                        if avail_bytes.remove(&target_byte) == true {
+                            break target_byte;
+                        }
+                    }
                 }
             };
-            let cur_byte = *avail_bytes.iter().nth(bsel).unwrap();
-            avail_bytes.remove(&cur_byte);
             let cond = Edge::InputU8 {
                 idx: cur_byte,
                 min: min,
@@ -340,6 +366,11 @@ void parser(volatile struct _shmem *shm, uint8_t *input, size_t input_size) {{
     if(cur_case > NUM_FUZZ_CASES) {{
         exit(0);
     }}
+    
+    // Bounds check the input
+    if(input_size < {INPUT_SIZE}) {{
+        return;
+    }}
 
 "#, INPUT_SIZE = INPUT_SIZE);
 
@@ -525,8 +556,8 @@ pub enum Edge {
 }
 
 fn main() {
-    let graph = Graph::new_rand_cond_noloop(2000);
-    //graph.dump_svg("../coverage_server/foo.svg").unwrap();
+    let graph = Graph::new_rand_cond_noloop(20);
+    graph.dump_svg("../coverage_server/foo.svg").unwrap();
     graph.generate_c("../afl_test/foo.c").unwrap();
 }
 
